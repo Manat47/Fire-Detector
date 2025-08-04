@@ -1,0 +1,141 @@
+#include <TridentTD_LineNotify.h>
+#include <WiFi.h>
+#include <DHT.h>
+
+#define SSID "NiGg..."
+#define PASSWORD "6530300414"
+#define LINE_TOKEN "39RdEenI9MnQKglWzMCJ3fF406tXAqgDvA8Rk3rTirP"
+
+#define AQ_GAS 36 
+#define DHTPIN 4
+#define LED_PIN 2
+#define RELAY_PIN 17
+
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+const int TEMP_THRESHOLD = 60;
+const int GAS_THRESHOLD = 500;
+const int TIMER_INTERVAL = 1000000; // 1 second in microseconds
+
+int lockGas = 0;
+int lockTemp = 0;
+unsigned long alertStartTime = 0;
+unsigned long powerCutTime = 0;
+bool powerCutNotified = false;
+bool warningNotified = false;
+bool sprinklerActivated = false;
+
+// Timer interrupt configuration
+hw_timer_t *timer = NULL;
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool watchdogResetFlag = false;
+
+
+
+// Timer interrupt service routine (ISR)
+void IRAM_ATTR onTimer() {
+    portENTER_CRITICAL_ISR(&timerMux);
+    watchdogResetFlag = true;  // Set flag for WDT reset
+    portEXIT_CRITICAL_ISR(&timerMux);
+}
+
+void setup() {
+    Serial.begin(115200);
+
+    // Connect to WiFi
+    WiFi.begin(SSID, PASSWORD);
+    Serial.printf("WiFi connecting to %s\n", SSID);
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print("."); delay(400);
+    }
+    Serial.printf("\nWiFi connected! IP: ");
+    Serial.println(WiFi.localIP());
+    LINE.setToken(LINE_TOKEN);
+
+    dht.begin();
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(RELAY_PIN, OUTPUT);
+    
+    // Initialize LED and relay to default states
+    digitalWrite(LED_PIN, HIGH);  // Normal state: LED ON
+    digitalWrite(RELAY_PIN, LOW); // Relay OFF
+
+    // Set up hardware timer (1-second interval for WDT monitoring)
+    timer = timerBegin(1000000);                
+    timerAttachInterrupt(timer, &onTimer);      
+    timerAlarm(timer, 1500000, true,0);                          
+}
+
+void loop() {
+    // Reset WDT if the flag is set
+    if (watchdogResetFlag) {
+        portENTER_CRITICAL(&timerMux);
+        watchdogResetFlag = false;
+        portEXIT_CRITICAL(&timerMux);
+        Serial.println("Watchdog timer reset");
+    }
+
+    // Read temperature and gas level
+    float temperature = dht.readTemperature();
+    int gasValue = analogRead(AQ_GAS);
+
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.print(" °C, Gas Level: ");
+    Serial.print(gasValue);
+
+    bool hazardCondition = false;
+
+    // Check temperature threshold
+    if (temperature >= TEMP_THRESHOLD && lockTemp == 0) {
+        digitalWrite(LED_PIN, HIGH);
+        LINE.notify("แจ้งเตือน: อุณหภูมิสูงถึงระดับอันตราย = " + String(temperature) + " °C");
+        Serial.println("High Temperature Detected! LED ON.");
+        lockTemp = 1;
+        hazardCondition = true;
+        alertStartTime = millis();
+    }
+
+    // Check gas threshold
+    if (gasValue >= GAS_THRESHOLD && lockGas == 0) {
+        LINE.notify("แจ้งเตือน: ระดับแก๊สถึงระดับอันตราย = " + String(gasValue) + " ppm");
+        Serial.println("High Gas Level Detected!");
+        lockGas = 1;
+        hazardCondition = true;
+        alertStartTime = millis();
+    }
+
+    // Further conditions for power cut and sprinkler activation
+    if ((lockGas || lockTemp) && (millis() - alertStartTime > 30000) && !warningNotified) {
+        LINE.notify("แจ้งเตือน: กำลังติดตามสถานการณ์ หากยังไม่ดีขึ้นจะทำการตัดไฟ");
+        Serial.println("Warning: If conditions persist, power will be cut.");
+        warningNotified = true;
+    }
+
+    if ((lockGas || lockTemp) && (millis() - alertStartTime > 60000) && !powerCutNotified) {
+        LINE.notify("แจ้งเตือน: สถานการณ์ยังไม่ดีขึ้น กำลังจะตัดไฟใน 3 วินาที...");
+        Serial.println("Preparing to cut power (LED OFF) in 3 seconds...");
+        delay(3000);
+        digitalWrite(LED_PIN, LOW);
+        LINE.notify("ทำการตัดไฟเรียบร้อยแล้ว");
+        Serial.println("Power cut (LED OFF) completed.");
+        powerCutTime = millis();
+        powerCutNotified = true;
+    }
+
+    if (powerCutNotified && (millis() - powerCutTime > 60000) && (temperature >= TEMP_THRESHOLD || gasPPM >= GAS_THRESHOLD) && !sprinklerActivated) {
+        LINE.notify("แจ้งเตือน: สถานการณ์ยังไม่ดีขึ้น กำลังเปิดสปริงเกอร์ฉีดน้ำ...");
+        Serial.println("Activating sprinklers...");
+        sprinklerActivated = true;
+        
+        for (int i = 0; i < 10; i++) {
+            digitalWrite(RELAY_PIN, HIGH);
+            delay(500);
+            digitalWrite(RELAY_PIN, LOW);
+            delay(500);
+        }
+    }
+
+    delay(2000); // Delay before the next check
+}
